@@ -1,0 +1,99 @@
+const login = require('fca-kaito');
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+const config = require('./config.json');
+const appstate = require('./appstate.json');
+const logger = require('./utils/logger');  // Added reference to logger
+
+global.heru = {
+    ENDPOINT: "https://nash-rest-api-production.up.railway.app/"
+};
+
+const commands = new Map();
+const commandFiles = fs.readdirSync(path.join(__dirname, 'commands')).filter(file => file.endsWith('.js'));
+
+console.log(`
+███╗░░██╗░█████╗░░██████╗██╗░░██╗
+████╗░██║██╔══██╗██╔════╝██║░░██║
+██╔██╗██║███████║╚█████╗░███████║
+██║╚████║██╔══██║░╚═══██╗██╔══██║
+██║░╚███║██║░░██║██████╔╝██║░░██║
+╚═╝░░╚══╝╚═╝░░╚═╝╚═════╝░╚═╝░░╚═╝
+`);
+
+const loadedCommands = commandFiles.map(file => file.replace('.js', ''));
+loadedCommands.forEach(cmd => console.log(`Loaded command: ${cmd}`));
+
+for (const file of commandFiles) {
+    const command = require(`./commands/${file}`);
+    commands.set(command.name, command);
+}
+
+const rateLimitMap = new Map();
+const RATE_LIMIT_MS = 5000;
+const KEEP_ALIVE_INTERVAL_MS = 300000;
+
+function sendMessageWithRateLimit(api, message, threadID, messageID) {
+    const now = Date.now();
+    const lastSent = rateLimitMap.get(threadID) || 0;
+    if (now - lastSent >= RATE_LIMIT_MS) {
+        api.sendMessage(message, threadID, messageID);
+        rateLimitMap.set(threadID, now);
+    }
+}
+
+function keepSessionAlive(api) {
+    setInterval(async () => {
+        try {
+            await axios.get('https://www.facebook.com');
+            console.log('Session keep-alive request sent.');
+        } catch (error) {
+            console.error('Error keeping session alive:', error);
+        }
+    }, KEEP_ALIVE_INTERVAL_MS);
+}
+
+login({ appState: appstate }, (err, api) => {
+    if (err) {
+        console.error('Error logging in:', err);
+        return;
+    }
+
+    console.log('Successfully logged in!');
+    keepSessionAlive(api);
+
+    api.listenMqtt((err, event) => {
+        if (err) {
+            console.error('Error in MQTT listener:', err);
+            return;
+        }
+
+        if (event.type === "message" || event.type === "message_reply") {
+            const message = event.body;
+            const uid = event.senderID;
+
+            let commandName = message.split(' ')[0].toLowerCase();
+            const args = message.split(' ').slice(1);
+
+            const isPrefixed = config.prefix && commandName.startsWith(config.prefix);
+            if (isPrefixed) {
+                commandName = commandName.slice(config.prefix.length).toLowerCase();
+            }
+
+            const command = commands.get(commandName);
+
+            if (command) {
+                if (command.useprefix && !isPrefixed) {
+                    return;
+                }
+                if (command.role === 'admin' && !config.adminUIDs.includes(uid)) {
+                    return sendMessageWithRateLimit(api, 'You do not have permission to use this command.', event.threadID, event.messageID);
+                }
+                command.execute(api, event, args);
+            } else {
+                sendMessageWithRateLimit(api, `Unknown command. Type '${config.prefix ? config.prefix : ''}help' for a list of commands.`, event.threadID, event.messageID);
+            }
+        }
+    });
+});
